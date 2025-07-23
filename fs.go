@@ -30,10 +30,16 @@ type Fs struct {
 }
 
 // NewOssFs creates a new ossfs.Fs object.
-func NewOssFs(accessKeyId, accessKeySecret, region, bucket string) *Fs {
+func NewOssFs(accessKeyId, accessKeySecret, region, bucket string, ossConfigFuncs ...OssConfigFunc) *Fs {
 	ossCfg := oss.LoadDefaultConfig().
 		WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKeyId, accessKeySecret)).
 		WithRegion(region)
+
+	if len(ossConfigFuncs) > 0 {
+		for _, f := range ossConfigFuncs {
+			f(ossCfg)
+		}
+	}
 
 	return &Fs{
 		manager: &utils.OssObjectManager{
