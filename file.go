@@ -10,6 +10,12 @@ import (
 	"github.com/spf13/afero"
 )
 
+const (
+	maxPreloadSize = 100 * 1024 * 1024 // 100MB max file size for preload
+	flagMask       = 0x3               // Mask for extracting read/write mode
+	flagMax        = 0x2               // Maximum value before masking needed
+)
+
 type File struct {
 	name     string
 	fs       *Fs
@@ -47,6 +53,15 @@ func NewOssFile(name string, flag int, fs *Fs) (*File, error) {
 
 // preload will preload the file to specific preload-filesystem.
 func (f *File) preload() error {
+	fi, err := f.fs.manager.GetObjectMeta(f.fs.ctx, f.fs.bucketName, f.name)
+	if err != nil {
+		return err
+	}
+
+	if fi.Size() > maxPreloadSize {
+		return fmt.Errorf("file too large for preload: %d bytes (max: %d bytes)", fi.Size(), maxPreloadSize)
+	}
+
 	pfs := f.fs.preloadFs
 	if _, err := pfs.Stat(f.name); err == nil {
 		if e := pfs.Remove(f.name); e != nil {
@@ -94,8 +109,8 @@ func (f *File) isReadable() bool {
 		return false
 	}
 	masked := f.openFlag
-	if masked > 0x2 {
-		masked = f.openFlag & 0x3
+	if masked > flagMax {
+		masked = f.openFlag & flagMask
 	}
 	return masked == os.O_RDONLY || masked == os.O_RDWR
 }
@@ -106,8 +121,8 @@ func (f *File) isWriteable() bool {
 		return false
 	}
 	masked := f.openFlag
-	if masked > 0x2 {
-		masked = f.openFlag & 0x3
+	if masked > flagMax {
+		masked = f.openFlag & flagMask
 	}
 	return masked == os.O_WRONLY || masked == os.O_RDWR
 }
@@ -243,26 +258,31 @@ func (f *File) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	err := f.Sync()
-	if err != nil {
-		return err
+	var firstErr error
+
+	if err := f.Sync(); err != nil {
+		firstErr = err
 	}
+
+	f.fs.filesMu.Lock()
 	delete(f.fs.openedFiles, f.name)
+	f.fs.filesMu.Unlock()
+
 	if f.preloaded {
-		err := f.fs.preloadFs.Remove(f.name)
-		if err != nil {
-			return err
+		if err := f.fs.preloadFs.Remove(f.name); err != nil && firstErr == nil {
+			firstErr = err
 		}
-		err = f.preloadedFd.Close()
-		if err != nil {
-			return err
+		if f.preloadedFd != nil {
+			if err := f.preloadedFd.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 		f.preloadedFd = nil
 		f.preloaded = false
 	}
 	f.dirty = false
 	f.closed = true
-	return nil
+	return firstErr
 }
 
 func (f *File) Name() string {
@@ -306,12 +326,19 @@ func (f *File) Stat() (os.FileInfo, error) {
 // Sync will sync the preloaded file into cloud storage.
 func (f *File) Sync() error {
 	if f.preloaded && f.preloadedFd != nil {
-		off, _ := f.preloadedFd.Seek(0, io.SeekCurrent)
-		f.preloadedFd.Seek(0, io.SeekStart)
+		off, err := f.preloadedFd.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		if _, err := f.preloadedFd.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
 		if _, err := f.fs.manager.PutObject(f.fs.ctx, f.fs.bucketName, f.name, f.preloadedFd); err != nil {
 			return err
 		}
-		f.preloadedFd.Seek(off, io.SeekStart)
+		if _, err := f.preloadedFd.Seek(off, io.SeekStart); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -14,7 +14,8 @@ Afero-OSS is an implementation of Alibaba Cloud Object Storage Service (OSS) bas
 - 🚀 Support for Alibaba Cloud OSS v2 SDK
 - 📂 Provides standard file and directory operations
 - 🔒 Concurrent safe design
-- 💾 Default memory preloading mechanism enabled to improve read and write performance
+- 💾 Memory preloading mechanism for efficient file operations (with 100MB size limit)
+- ⚡ Manual sync control for optimized performance
 
 ## Installation
 
@@ -54,6 +55,9 @@ func main() {
     defer file.Close()
 
     file.WriteString("Hello, Afero-OSS!")
+    
+    // Important: Manually sync to upload changes to OSS
+    file.Sync()
 }
 ```
 
@@ -64,16 +68,34 @@ func main() {
 - File metadata retrieval
 - File preloading and synchronization
 
-## Limitations
+## Best Practices
 
-- Does not support file system-specific operations like `Chmod`, `Chown`
-- Depends on Alibaba Cloud OSS service
-- Default memory preloading for file objects is not recommended for large files. Switch preloading file system objects based on usage:
+### Manual Synchronization
+
+By default, `autoSync` is disabled for better performance. You need to manually call `Sync()` to upload changes to OSS:
 
 ```go
-ossFs := NewOssFs(...)
+file, _ := ossFs.Create("example.txt")
+file.WriteString("Hello, World!")
+file.Sync()  // Upload to OSS
+file.Close()
+```
+
+### File Size Considerations
+
+The preload mechanism has a 100MB size limit. For larger files, use a disk-based preload filesystem:
+
+```go
+ossFs := ossfs.NewOssFs(...)
 ossFs.WithPreloadFs(afero.NewBasePathFs(afero.NewOsFs(), "/tmp"))
 ```
+
+## Limitations
+
+- Does not support file system-specific operations like `Chmod`, `Chown`, `Chtimes`
+- Depends on Alibaba Cloud OSS service
+- Preload size limit: 100MB per file (configurable via `WithPreloadFs`)
+- Requires manual `Sync()` calls to persist changes (autoSync is disabled by default)
 
 ## Contributing
 

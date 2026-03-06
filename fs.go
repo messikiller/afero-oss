@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
@@ -25,6 +26,7 @@ type Fs struct {
 	separator   string
 	autoSync    bool
 	openedFiles map[string]afero.File
+	filesMu     sync.RWMutex
 	preloadFs   afero.Fs
 	ctx         context.Context
 	ossCfg      *oss.Config
@@ -32,6 +34,19 @@ type Fs struct {
 
 // NewOssFs creates a new ossfs.Fs object.
 func NewOssFs(accessKeyId, accessKeySecret, region, bucket string, ossOpts ...OSSOptionFunc) *Fs {
+	if accessKeyId == "" {
+		panic("accessKeyId cannot be empty")
+	}
+	if accessKeySecret == "" {
+		panic("accessKeySecret cannot be empty")
+	}
+	if region == "" {
+		panic("region cannot be empty")
+	}
+	if bucket == "" {
+		panic("bucket cannot be empty")
+	}
+
 	ossCfg := oss.LoadDefaultConfig().
 		WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKeyId, accessKeySecret)).
 		WithRegion(region)
@@ -48,7 +63,7 @@ func NewOssFs(accessKeyId, accessKeySecret, region, bucket string, ossOpts ...OS
 		},
 		bucketName:  bucket,
 		separator:   "/",
-		autoSync:    true,
+		autoSync:    false,
 		openedFiles: make(map[string]afero.File),
 		preloadFs:   afero.NewMemMapFs(),
 		ctx:         context.Background(),
@@ -103,7 +118,11 @@ func (fs *Fs) Open(name string) (afero.File, error) {
 // OpenFile opens a file using the given flags and the given mode.
 func (fs *Fs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
 	name = fs.normFileName(name)
+
+	fs.filesMu.RLock()
 	file, found := fs.openedFiles[name]
+	fs.filesMu.RUnlock()
+
 	if found && file.(*File).openFlag == flag {
 		return file, nil
 	}
@@ -123,7 +142,7 @@ func (fs *Fs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, err
 		return nil, afero.ErrFileNotFound
 	}
 
-	if !existed && f.openFlag*os.O_CREATE != 0 {
+	if !existed && f.openFlag&os.O_CREATE != 0 {
 		if _, err := fs.Create(f.name); err != nil {
 			return nil, err
 		}
@@ -136,7 +155,9 @@ func (fs *Fs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, err
 		}
 	}
 
+	fs.filesMu.Lock()
 	fs.openedFiles[name] = f
+	fs.filesMu.Unlock()
 
 	return f, nil
 }

@@ -38,7 +38,7 @@ func TestNewOssFs(t *testing.T) {
 			expected: &Fs{
 				bucketName:  "test-bucket",
 				separator:   "/",
-				autoSync:    true,
+				autoSync:    false,
 				openedFiles: make(map[string]afero.File),
 				preloadFs:   afero.NewMemMapFs(),
 				ctx:         context.Background(),

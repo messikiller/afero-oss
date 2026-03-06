@@ -81,8 +81,8 @@ func (m *OssObjectManager) PutObject(ctx context.Context, bucket, name string, r
 func (m *OssObjectManager) CopyObject(ctx context.Context, bucket, srcName, targetName string) error {
 	req := &oss.CopyObjectRequest{
 		Bucket:       oss.Ptr(bucket),
-		Key:          oss.Ptr(srcName),
-		SourceKey:    oss.Ptr(targetName),
+		Key:          oss.Ptr(targetName),
+		SourceKey:    oss.Ptr(srcName),
 		SourceBucket: oss.Ptr(bucket),
 		StorageClass: oss.StorageClassStandard,
 	}
@@ -117,8 +117,6 @@ func (m *OssObjectManager) ListObjects(ctx context.Context, bucket, prefix strin
 
 	s := make([]os.FileInfo, 0)
 
-	var i int
-
 loop:
 	for p.HasNext() {
 		page, err := p.NextPage(ctx)
@@ -127,15 +125,14 @@ loop:
 		}
 
 		for _, obj := range page.Contents {
-			i++
-			if i == count {
-				break loop
-			}
 			s = append(s, &OssObjectMeta{
 				name:           oss.ToString(obj.Key),
 				size:           obj.Size,
 				lastModifiedAt: oss.ToTime(obj.LastModified),
 			})
+			if len(s) >= count {
+				break loop
+			}
 		}
 	}
 

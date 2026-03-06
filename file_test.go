@@ -429,8 +429,8 @@ func TestFileDoWriteAt(t *testing.T) {
 
 		fs.manager.(*mocks.MockObjectManager).
 			EXPECT().
-			GetObject(f.fs.ctx, f.fs.bucketName, f.name).
-			Return(nil, nil, fmt.Errorf("preload error"))
+			GetObjectMeta(f.fs.ctx, f.fs.bucketName, f.name).
+			Return(nil, fmt.Errorf("preload error"))
 
 		_, e := f.doWriteAt(p, 0)
 
@@ -442,15 +442,18 @@ func TestFileDoWriteAt(t *testing.T) {
 		fs := getMockedFs(t)
 		f := getMockedFile("testfile", os.O_WRONLY, fs)
 
+		fi := getMockedFileInfo(t)
+		fi.EXPECT().Size().Return(int64(0))
+
+		fs.manager.(*mocks.MockObjectManager).
+			EXPECT().
+			GetObjectMeta(mock.Anything, mock.Anything, mock.Anything).
+			Return(fi, nil)
+
 		fs.manager.(*mocks.MockObjectManager).
 			EXPECT().
 			GetObject(mock.Anything, mock.Anything, mock.Anything).
 			Return(strings.NewReader(""), utils.CleanUp(func() {}), nil)
-
-		fs.manager.(*mocks.MockObjectManager).
-			EXPECT().
-			PutObject(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-			Return(true, nil)
 
 		fs.preloadFs = afero.NewMemMapFs()
 		defer fs.preloadFs.Remove(f.name)
@@ -471,15 +474,19 @@ func TestFileDoWriteAt(t *testing.T) {
 		fs := getMockedFs(t)
 		f := getMockedFile("testfile", os.O_WRONLY, fs)
 
-		fs.manager.(*mocks.MockObjectManager).
-			EXPECT().
-			GetObject(mock.Anything, mock.Anything, mock.Anything).
-			Return(strings.NewReader("abcdefg"), utils.CleanUp(func() {}), nil)
+		originalContent := "abcdefg"
+		fi := getMockedFileInfo(t)
+		fi.EXPECT().Size().Return(int64(len(originalContent)))
 
 		fs.manager.(*mocks.MockObjectManager).
 			EXPECT().
-			PutObject(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-			Return(true, nil)
+			GetObjectMeta(mock.Anything, mock.Anything, mock.Anything).
+			Return(fi, nil)
+
+		fs.manager.(*mocks.MockObjectManager).
+			EXPECT().
+			GetObject(mock.Anything, mock.Anything, mock.Anything).
+			Return(strings.NewReader(originalContent), utils.CleanUp(func() {}), nil)
 
 		fs.preloadFs = afero.NewMemMapFs()
 		defer fs.preloadFs.Remove(f.name)
@@ -538,15 +545,18 @@ func TestFileWrite(t *testing.T) {
 		fs.preloadFs = afero.NewMemMapFs()
 		defer fs.preloadFs.Remove("testfile")
 
+		fi := getMockedFileInfo(t)
+		fi.EXPECT().Size().Return(int64(0))
+
+		fs.manager.(*mocks.MockObjectManager).
+			EXPECT().
+			GetObjectMeta(mock.Anything, mock.Anything, mock.Anything).
+			Return(fi, nil)
+
 		fs.manager.(*mocks.MockObjectManager).
 			EXPECT().
 			GetObject(mock.Anything, mock.Anything, mock.Anything).
 			Return(strings.NewReader(""), utils.CleanUp(func() {}), nil)
-
-		fs.manager.(*mocks.MockObjectManager).
-			EXPECT().
-			PutObject(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-			Return(true, nil)
 
 		p := []byte("testdata")
 		n, err := f.Write(p)
@@ -570,17 +580,17 @@ func TestFileWrite(t *testing.T) {
 
 		originalContent := "this is original content"
 
-		fi.EXPECT().Size().Return(int64(len(originalContent)))
+		fi.EXPECT().Size().Return(int64(len(originalContent))).Times(2)
+
+		fs.manager.(*mocks.MockObjectManager).
+			EXPECT().
+			GetObjectMeta(mock.Anything, mock.Anything, mock.Anything).
+			Return(fi, nil).Times(2)
 
 		fs.manager.(*mocks.MockObjectManager).
 			EXPECT().
 			GetObject(mock.Anything, mock.Anything, mock.Anything).
 			Return(strings.NewReader(originalContent), utils.CleanUp(func() {}), nil)
-
-		fs.manager.(*mocks.MockObjectManager).
-			EXPECT().
-			PutObject(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-			Return(true, nil)
 
 		fs.manager.(*mocks.MockObjectManager).
 			EXPECT().
@@ -654,15 +664,18 @@ func TestFileWriteAt(t *testing.T) {
 		defer fs.preloadFs.Remove("testfile")
 
 		originalContent := "original content"
+		fi := getMockedFileInfo(t)
+		fi.EXPECT().Size().Return(int64(len(originalContent)))
+
+		fs.manager.(*mocks.MockObjectManager).
+			EXPECT().
+			GetObjectMeta(mock.Anything, mock.Anything, mock.Anything).
+			Return(fi, nil)
+
 		fs.manager.(*mocks.MockObjectManager).
 			EXPECT().
 			GetObject(mock.Anything, mock.Anything, mock.Anything).
 			Return(strings.NewReader(originalContent), utils.CleanUp(func() {}), nil)
-
-		fs.manager.(*mocks.MockObjectManager).
-			EXPECT().
-			PutObject(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-			Return(true, nil)
 
 		p := []byte("test")
 		n, err := f.WriteAt(p, 8)
