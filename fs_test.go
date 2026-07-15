@@ -3,556 +3,204 @@ package ossfs
 import (
 	"context"
 	"os"
-	"strings"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 	"github.com/spf13/afero"
-	"github.com/stretchr/testify/assert"
-
-	"github.com/messikiller/afero-oss/internal/mocks"
+	"github.com/stretchr/testify/require"
 )
 
-func TestNewOssFs(t *testing.T) {
-	tests := []struct {
-		name            string
-		accessKeyId     string
-		accessKeySecret string
-		region          string
-		bucket          string
-		ossOptFuncs     []OSSOptionFunc
-		expected        *Fs
-	}{
-		{
-			name:            "valid credentials",
-			accessKeyId:     "testKeyId",
-			accessKeySecret: "testKeySecret",
-			region:          "test-region",
-			bucket:          "test-bucket",
-			ossOptFuncs: []OSSOptionFunc{func(c *oss.Config) {
-				c.WithEndpoint("testEndpoint")
-			}, func(c *oss.Config) {
-				c.WithUserAgent("testUA")
-			}},
-			expected: &Fs{
-				bucketName:  "test-bucket",
-				separator:   "/",
-				autoSync:    false,
-				openedFiles: make(map[string]afero.File),
-				preloadFs:   afero.NewMemMapFs(),
-				ctx:         context.Background(),
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := NewOssFs(tt.accessKeyId, tt.accessKeySecret, tt.region, tt.bucket, tt.ossOptFuncs...)
-			assert.NotNil(t, got.manager)
-			assert.Equal(t, tt.expected.bucketName, got.bucketName)
-			assert.Equal(t, tt.expected.separator, got.separator)
-			assert.Equal(t, tt.expected.autoSync, got.autoSync)
-			assert.NotNil(t, got.openedFiles)
-			assert.NotNil(t, got.preloadFs)
-			assert.NotNil(t, got.ctx)
-			assert.Equal(t, "testEndpoint", *got.ossCfg.Endpoint)
-			assert.Equal(t, "testUA", *got.ossCfg.UserAgent)
-		})
-	}
+func TestNewOssFsOptions(t *testing.T) {
+	fs := NewOssFs("ak", "sk", "region", "bucket").
+		WithContext(context.Background()).
+		WithAutoSync(true).
+		WithMaxPreloadSize(0)
+	require.NotNil(t, fs.ctx)
+	require.True(t, fs.autoSync)
+	require.Zero(t, fs.maxPreloadSize)
+	require.Equal(t, "OssFs", fs.Name())
 }
 
-func TestFsWithContext(t *testing.T) {
-	type bgMeta string
-	tests := []struct {
-		name     string
-		fs       *Fs
-		ctx      context.Context
-		expected *Fs
-	}{
-		{
-			name: "set new context",
-			fs: &Fs{
-				ctx: context.Background(),
-			},
-			ctx: context.WithValue(context.Background(), bgMeta("testKey"), bgMeta("testValue")),
-			expected: &Fs{
-				ctx: context.WithValue(context.Background(), bgMeta("testKey"), bgMeta("testValue")),
-			},
-		},
-		{
-			name: "set nil context",
-			fs: &Fs{
-				ctx: context.Background(),
-			},
-			ctx: nil,
-			expected: &Fs{
-				ctx: nil,
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tt.fs.WithContext(tt.ctx)
-			assert.Equal(t, tt.expected.ctx, got.ctx)
-			assert.Equal(t, tt.fs, got)
-		})
-	}
+func TestOpenDoesNotCreateMissingObject(t *testing.T) {
+	fs, manager := newTestFs(nil)
+	_, err := fs.Open("missing.txt")
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.False(t, manager.has("missing.txt"))
 }
 
-func TestFsCreate(t *testing.T) {
-	m := mocks.NewMockObjectManager(t)
-	bucket := "test-bucket"
-	ctx := context.TODO()
-
-	fs := &Fs{
-		manager:    m,
-		bucketName: bucket,
-		ctx:        ctx,
-		separator:  "/",
-	}
-
-	t.Run("create simple success", func(t *testing.T) {
-		m.EXPECT().
-			PutObject(fs.ctx, bucket, "test.txt", strings.NewReader("")).
-			Return(true, nil).
-			Once()
-		file, err := fs.Create("test.txt")
-		assert.Nil(t, err)
-		assert.NotNil(t, file)
-		assert.Implements(t, (*afero.File)(nil), file)
-		m.AssertExpectations(t)
+func TestOpenFileFlags(t *testing.T) {
+	t.Run("exclusive create preserves existing data", func(t *testing.T) {
+		fs, manager := newTestFs(map[string]string{"file.txt": "original"})
+		_, err := fs.OpenFile("file.txt", os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		require.ErrorIs(t, err, os.ErrExist)
+		require.Equal(t, "original", manager.content("file.txt"))
 	})
 
-	t.Run("create prefixed file path success", func(t *testing.T) {
-		m.EXPECT().
-			PutObject(fs.ctx, bucket, "path/to/test.txt", strings.NewReader("")).
-			Return(true, nil).
-			Once()
-		file, err := fs.Create("/path/to/test.txt")
-		assert.Nil(t, err)
-		assert.NotNil(t, file)
-		assert.Implements(t, (*afero.File)(nil), file)
-		m.AssertExpectations(t)
+	t.Run("read only truncate is rejected", func(t *testing.T) {
+		fs, manager := newTestFs(map[string]string{"file.txt": "original"})
+		_, err := fs.OpenFile("file.txt", os.O_RDONLY|os.O_TRUNC, 0)
+		require.ErrorIs(t, err, syscall.EINVAL)
+		require.Equal(t, "original", manager.content("file.txt"))
 	})
 
-	t.Run("create dir path success", func(t *testing.T) {
-		m.EXPECT().
-			PutObject(ctx, bucket, "path/to/test_dir/", strings.NewReader("")).
-			Return(true, nil).
-			Once()
-
-		file, err := fs.Create("/path/to/test_dir/")
-		assert.Nil(t, err)
-		assert.NotNil(t, file)
-		assert.Implements(t, (*afero.File)(nil), file)
-		assert.Equal(t, "path/to/test_dir/", file.Name())
-		m.AssertExpectations(t)
-	})
-
-	t.Run("create failure", func(t *testing.T) {
-		m.EXPECT().
-			PutObject(fs.ctx, bucket, "test2.txt", strings.NewReader("")).
-			Return(false, afero.ErrFileNotFound).
-			Once()
-		_, err := fs.Create("test2.txt")
-		assert.NotNil(t, err)
-		assert.ErrorIs(t, err, afero.ErrFileNotFound)
-		m.AssertExpectations(t)
+	t.Run("create truncates existing object", func(t *testing.T) {
+		fs, manager := newTestFs(map[string]string{"file.txt": "original"})
+		file, err := fs.Create("file.txt")
+		require.NoError(t, err)
+		require.Equal(t, "", manager.content("file.txt"))
+		require.NoError(t, file.Close())
 	})
 }
 
-func TestFsMkdirAll(t *testing.T) {
-	m := mocks.NewMockObjectManager(t)
-	bucket := "test-bucket"
-	ctx := context.TODO()
+func TestOpenReturnsIndependentHandles(t *testing.T) {
+	fs, _ := newTestFs(map[string]string{"file.txt": "data"})
+	first, err := fs.Open("file.txt")
+	require.NoError(t, err)
+	second, err := fs.Open("file.txt")
+	require.NoError(t, err)
+	require.NotSame(t, first, second)
+	require.NoError(t, first.Close())
 
-	fs := &Fs{
-		manager:    m,
-		bucketName: bucket,
-		ctx:        ctx,
-		separator:  "/",
+	buf := make([]byte, 4)
+	_, err = second.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, "data", string(buf))
+}
+
+func TestDirectoryLifecycle(t *testing.T) {
+	fs, manager := newTestFs(nil)
+	require.NoError(t, fs.MkdirAll("a/b/c", 0o755))
+	for _, key := range []string{"a/", "a/b/", "a/b/c/"} {
+		require.True(t, manager.has(key), key)
 	}
 
-	t.Run("MkDirAll simple success", func(t *testing.T) {
-		m.EXPECT().
-			PutObject(fs.ctx, bucket, "path/to/test_dir/", strings.NewReader("")).
-			Return(true, nil).
-			Once()
-		err := fs.MkdirAll("/path/to/test_dir/", defaultFileMode)
-		assert.Nil(t, err)
-		m.AssertExpectations(t)
+	info, err := fs.Stat("a/b")
+	require.NoError(t, err)
+	require.True(t, info.IsDir())
+
+	file, err := fs.Open("a/b/")
+	require.NoError(t, err)
+	entries, err := file.Readdir(-1)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, "c", entries[0].Name())
+	require.True(t, entries[0].IsDir())
+}
+
+func TestMkdirRejectsExistingPathAndCreatesNewMarker(t *testing.T) {
+	fs, manager := newTestFs(map[string]string{"existing/": ""})
+	require.ErrorIs(t, fs.Mkdir("existing", 0o755), os.ErrExist)
+	require.NoError(t, fs.Mkdir("new", 0o755))
+	require.True(t, manager.has("new/"))
+}
+
+func TestImplicitDirectoryAndRootListing(t *testing.T) {
+	fs, _ := newTestFs(map[string]string{
+		"one.txt":        "1",
+		"dir/a.txt":      "a",
+		"dir/sub/b.txt":  "b",
+		"other/data.txt": "d",
+	})
+	info, err := fs.Stat("dir")
+	require.NoError(t, err)
+	require.True(t, info.IsDir())
+
+	root, err := fs.Open("/")
+	require.NoError(t, err)
+	names, err := root.Readdirnames(-1)
+	require.NoError(t, err)
+	require.Equal(t, []string{"dir", "one.txt", "other"}, names)
+}
+
+func TestRemoveAndRemoveAll(t *testing.T) {
+	t.Run("remove rejects non-empty directory", func(t *testing.T) {
+		fs, _ := newTestFs(map[string]string{"dir/": "", "dir/file": "data"})
+		err := fs.Remove("dir")
+		require.ErrorIs(t, err, syscall.ENOTEMPTY)
 	})
 
-	t.Run("MkDirAll failure", func(t *testing.T) {
-		m.EXPECT().
-			PutObject(fs.ctx, bucket, "path/to/test_dir/", strings.NewReader("")).
-			Return(false, afero.ErrFileClosed).
-			Once()
-		err := fs.MkdirAll("/path/to/test_dir/", defaultFileMode)
-		assert.NotNil(t, err)
-		assert.ErrorIs(t, err, afero.ErrFileClosed)
-		m.AssertExpectations(t)
+	t.Run("RemoveAll handles files", func(t *testing.T) {
+		fs, manager := newTestFs(map[string]string{"file": "data", "other": "keep"})
+		require.NoError(t, fs.RemoveAll("file"))
+		require.False(t, manager.has("file"))
+		require.True(t, manager.has("other"))
+	})
+
+	t.Run("RemoveAll root clears every key", func(t *testing.T) {
+		fs, manager := newTestFs(map[string]string{"a": "1", "dir/b": "2"})
+		require.NoError(t, fs.RemoveAll("/"))
+		require.False(t, manager.has("a"))
+		require.False(t, manager.has("dir/b"))
 	})
 }
 
-func TestFsOpenFile(t *testing.T) {
-	m := mocks.NewMockObjectManager(t)
-	bucket := "test-bucket"
-	ctx := context.TODO()
-
-	fs := &Fs{
-		manager:     m,
-		bucketName:  bucket,
-		ctx:         ctx,
-		separator:   "/",
-		openedFiles: make(map[string]afero.File),
+func TestRenameNormalizesAndRecurses(t *testing.T) {
+	fs, manager := newTestFs(map[string]string{
+		"old/":         "",
+		"old/file.txt": "data",
+		"old/sub/x":    "x",
+	})
+	require.NoError(t, fs.Rename("/old/", "new//"))
+	for _, key := range []string{"new/", "new/file.txt", "new/sub/x"} {
+		require.True(t, manager.has(key), key)
 	}
-
-	t.Run("open existing file success", func(t *testing.T) {
-		m.EXPECT().
-			IsObjectExist(ctx, bucket, "test.txt").
-			Return(true, nil).
-			Once()
-		file, err := fs.OpenFile("test.txt", os.O_RDONLY, 0o644)
-		assert.Nil(t, err)
-		assert.NotNil(t, file)
-		assert.Implements(t, (*afero.File)(nil), file)
-		m.AssertExpectations(t)
-	})
-
-	t.Run("open non-existing file with create flag success", func(t *testing.T) {
-		m.EXPECT().
-			IsObjectExist(ctx, bucket, "new.txt").
-			Return(false, nil).
-			Once()
-		m.EXPECT().
-			PutObject(ctx, bucket, "new.txt", strings.NewReader("")).
-			Return(true, nil).
-			Once()
-		file, err := fs.OpenFile("new.txt", os.O_CREATE|os.O_RDWR, 0o644)
-		assert.Nil(t, err)
-		assert.NotNil(t, file)
-		assert.Implements(t, (*afero.File)(nil), file)
-		m.AssertExpectations(t)
-	})
-
-	t.Run("open file with truncate flag success", func(t *testing.T) {
-		m.EXPECT().
-			IsObjectExist(ctx, bucket, "trunc.txt").
-			Return(true, nil).
-			Once()
-		m.EXPECT().
-			PutObject(ctx, bucket, "trunc.txt", strings.NewReader("")).
-			Return(true, nil).
-			Once()
-		file, err := fs.OpenFile("trunc.txt", os.O_TRUNC|os.O_RDWR, 0o644)
-		assert.Nil(t, err)
-		assert.NotNil(t, file)
-		assert.Implements(t, (*afero.File)(nil), file)
-		m.AssertExpectations(t)
-	})
-
-	t.Run("open existing file from cache", func(t *testing.T) {
-		cachedFile := &File{name: "cached.txt", openFlag: os.O_RDONLY}
-		fs.openedFiles["cached.txt"] = cachedFile
-		file, err := fs.OpenFile("cached.txt", os.O_RDONLY, 0o644)
-		assert.Nil(t, err)
-		assert.Equal(t, cachedFile, file)
-		assert.Implements(t, (*afero.File)(nil), file)
-	})
-
-	t.Run("open non-existing file without create flag fails", func(t *testing.T) {
-		m.EXPECT().
-			IsObjectExist(ctx, bucket, "nonexist.txt").
-			Return(false, nil).
-			Once()
-		_, err := fs.OpenFile("nonexist.txt", os.O_RDONLY, 0o644)
-		assert.NotNil(t, err)
-		assert.ErrorIs(t, err, afero.ErrFileNotFound)
-		m.AssertExpectations(t)
-	})
-
-	t.Run("open file with check exist error fails", func(t *testing.T) {
-		m.EXPECT().
-			IsObjectExist(ctx, bucket, "error.txt").
-			Return(false, afero.ErrFileNotFound).
-			Once()
-		_, err := fs.OpenFile("error.txt", os.O_RDONLY, 0o644)
-		assert.NotNil(t, err)
-		assert.ErrorIs(t, err, afero.ErrFileNotFound)
-		m.AssertExpectations(t)
-	})
-}
-
-func TestFsRemove(t *testing.T) {
-	m := mocks.NewMockObjectManager(t)
-	bucket := "test-bucket"
-	ctx := context.TODO()
-
-	fs := &Fs{
-		manager:    m,
-		bucketName: bucket,
-		ctx:        ctx,
-		separator:  "/",
+	for _, key := range []string{"old/", "old/file.txt", "old/sub/x"} {
+		require.False(t, manager.has(key), key)
 	}
+}
 
-	t.Run("remove file success", func(t *testing.T) {
-		m.EXPECT().DeleteObject(fs.ctx, bucket, "test.txt").Return(nil).Once()
-		err := fs.Remove("test.txt")
-		assert.Nil(t, err)
-		m.AssertExpectations(t)
+func TestRenameEdgeCases(t *testing.T) {
+	t.Run("same path is a no-op", func(t *testing.T) {
+		fs, manager := newTestFs(map[string]string{"file": "data"})
+		require.NoError(t, fs.Rename("/file", "file"))
+		require.Equal(t, "data", manager.content("file"))
 	})
 
-	t.Run("remove prefixed file success", func(t *testing.T) {
-		m.EXPECT().DeleteObject(fs.ctx, bucket, "path/to/test.txt").Return(nil).Once()
-		err := fs.Remove("/path/to/test.txt")
-		assert.Nil(t, err)
-		m.AssertExpectations(t)
+	t.Run("file cannot replace directory", func(t *testing.T) {
+		fs, manager := newTestFs(map[string]string{"file": "data", "dir/": ""})
+		err := fs.Rename("file", "dir")
+		require.ErrorIs(t, err, syscall.EISDIR)
+		require.True(t, manager.has("file"))
 	})
 
-	t.Run("remove non-existent file", func(t *testing.T) {
-		m.EXPECT().DeleteObject(fs.ctx, bucket, "nonexistent.txt").Return(afero.ErrFileNotFound).Once()
-		err := fs.Remove("nonexistent.txt")
-		assert.NotNil(t, err)
-		assert.ErrorIs(t, err, afero.ErrFileNotFound)
-		m.AssertExpectations(t)
+	t.Run("directory cannot move into itself", func(t *testing.T) {
+		fs, _ := newTestFs(map[string]string{"dir/": "", "dir/file": "data"})
+		err := fs.Rename("dir", "dir/sub")
+		require.ErrorIs(t, err, syscall.EINVAL)
 	})
 }
 
-func TestFsRemoveAll(t *testing.T) {
-	m := mocks.NewMockObjectManager(t)
-	bucket := "test-bucket"
-	ctx := context.TODO()
-
-	fs := &Fs{
-		manager:    m,
-		bucketName: bucket,
-		ctx:        ctx,
-		separator:  "/",
-	}
-
-	t.Run("remove non-empty directory", func(t *testing.T) {
-		dirPath := "path/to/dir/"
-		files := []os.FileInfo{
-			NewFileInfo("path/to/dir/file1.txt", 100, time.Now()),
-			NewFileInfo("path/to/dir/file2.txt", 200, time.Now()),
-			NewFileInfo("path/to/dir/subdir/", 0, time.Now()),
-		}
-
-		m.EXPECT().ListAllObjects(ctx, bucket, dirPath).Return(files, nil).Once()
-		m.EXPECT().DeleteObject(ctx, bucket, "path/to/dir/file1.txt").Return(nil).Once()
-		m.EXPECT().DeleteObject(ctx, bucket, "path/to/dir/file2.txt").Return(nil).Once()
-		m.EXPECT().DeleteObject(ctx, bucket, "path/to/dir/subdir/").Return(nil).Once()
-
-		err := fs.RemoveAll(dirPath)
-		assert.Nil(t, err)
-		m.AssertExpectations(t)
-	})
-
-	t.Run("remove empty directory", func(t *testing.T) {
-		dirPath := "empty/dir/"
-		m.EXPECT().ListAllObjects(ctx, bucket, dirPath).Return([]os.FileInfo{}, nil).Once()
-
-		err := fs.RemoveAll(dirPath)
-		assert.Nil(t, err)
-		m.AssertExpectations(t)
-	})
-
-	t.Run("remove non-existent path", func(t *testing.T) {
-		nonExistentPath := "nonexistent/path/"
-		m.EXPECT().ListAllObjects(ctx, bucket, nonExistentPath).Return([]os.FileInfo{}, nil).Once()
-
-		err := fs.RemoveAll(nonExistentPath)
-		assert.Nil(t, err)
-		m.AssertExpectations(t)
-	})
-
-	t.Run("list objects failure", func(t *testing.T) {
-		dirPath := "path/to/dir/"
-		m.EXPECT().ListAllObjects(ctx, bucket, dirPath).Return(nil, afero.ErrFileNotFound).Once()
-
-		err := fs.RemoveAll(dirPath)
-		assert.NotNil(t, err)
-		assert.ErrorIs(t, err, afero.ErrFileNotFound)
-		m.AssertExpectations(t)
-	})
-
-	t.Run("delete object failure", func(t *testing.T) {
-		dirPath := "path/to/dir/"
-		files := []os.FileInfo{
-			NewFileInfo("path/to/dir/file1.txt", 0, time.Now()),
-		}
-
-		m.EXPECT().ListAllObjects(ctx, bucket, dirPath).Return(files, nil).Once()
-		m.EXPECT().DeleteObject(ctx, bucket, "path/to/dir/file1.txt").Return(afero.ErrFileNotFound).Once()
-
-		err := fs.RemoveAll(dirPath)
-		assert.NotNil(t, err)
-		assert.ErrorIs(t, err, afero.ErrFileNotFound)
-		m.AssertExpectations(t)
-	})
+func TestPathNormalization(t *testing.T) {
+	fs, _ := newTestFs(nil)
+	require.Equal(t, "a/c/", fs.normFileName("/a//b/../c/"))
+	require.Equal(t, "", fs.normFileName("/"))
+	require.Equal(t, "a/b", fs.normFileName(`a\b`))
 }
 
-func TestFsRename(t *testing.T) {
-	m := mocks.NewMockObjectManager(t)
-	bucket := "test-bucket"
-	ctx := context.TODO()
+func TestAferoHelpers(t *testing.T) {
+	fs, manager := newTestFs(map[string]string{"existing.txt": "old"})
+	require.NoError(t, afero.WriteFile(fs, "dir/new.txt", []byte("new"), 0o600))
+	require.Equal(t, "new", manager.content("dir/new.txt"))
 
-	fs := &Fs{
-		manager:    m,
-		bucketName: bucket,
-		ctx:        ctx,
-		separator:  "/",
-	}
+	data, err := afero.ReadFile(fs, "dir/new.txt")
+	require.NoError(t, err)
+	require.Equal(t, "new", string(data))
 
-	t.Run("successful rename", func(t *testing.T) {
-		oldname := "old/file.txt"
-		newname := "new/file.txt"
+	entries, err := afero.ReadDir(fs, ".")
+	require.NoError(t, err)
+	require.Equal(t, []string{"dir", "existing.txt"}, []string{entries[0].Name(), entries[1].Name()})
 
-		m.EXPECT().CopyObject(ctx, bucket, oldname, newname).Return(nil).Once()
-		m.EXPECT().DeleteObject(ctx, bucket, oldname).Return(nil).Once()
-
-		err := fs.Rename(oldname, newname)
-		assert.Nil(t, err)
-		m.AssertExpectations(t)
-	})
-
-	t.Run("copy failure", func(t *testing.T) {
-		oldname := "old/file.txt"
-		newname := "new/file.txt"
-
-		m.EXPECT().CopyObject(ctx, bucket, oldname, newname).Return(afero.ErrFileNotFound).Once()
-
-		err := fs.Rename(oldname, newname)
-		assert.NotNil(t, err)
-		assert.ErrorIs(t, err, afero.ErrFileNotFound)
-		m.AssertExpectations(t)
-	})
-
-	t.Run("delete failure after successful copy", func(t *testing.T) {
-		oldname := "old/file.txt"
-		newname := "new/file.txt"
-
-		m.EXPECT().CopyObject(ctx, bucket, oldname, newname).Return(nil).Once()
-		m.EXPECT().DeleteObject(ctx, bucket, oldname).Return(afero.ErrFileNotFound).Once()
-
-		err := fs.Rename(oldname, newname)
-		assert.NotNil(t, err)
-		assert.ErrorIs(t, err, afero.ErrFileNotFound)
-		m.AssertExpectations(t)
-	})
+	_, err = afero.ReadFile(fs, "missing.txt")
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.False(t, manager.has("missing.txt"))
 }
 
-func TestFsStat(t *testing.T) {
-	m := mocks.NewMockObjectManager(t)
-	bucket := "test-bucket"
-	ctx := context.TODO()
-
-	fs := &Fs{
-		manager:    m,
-		bucketName: bucket,
-		ctx:        ctx,
-		separator:  "/",
-	}
-
-	t.Run("stat file success", func(t *testing.T) {
-		expectedInfo := mocks.NewMockFileInfo(t)
-		m.EXPECT().GetObjectMeta(fs.ctx, bucket, "test.txt").Return(expectedInfo, nil).Once()
-		info, err := fs.Stat("test.txt")
-		assert.Nil(t, err)
-		assert.Equal(t, expectedInfo, info)
-		m.AssertExpectations(t)
-	})
-
-	t.Run("stat prefixed file path success", func(t *testing.T) {
-		expectedInfo := mocks.NewMockFileInfo(t)
-		m.EXPECT().GetObjectMeta(fs.ctx, bucket, "path/to/test.txt").Return(expectedInfo, nil).Once()
-		info, err := fs.Stat("/path/to/test.txt")
-		assert.Nil(t, err)
-		assert.Equal(t, expectedInfo, info)
-		m.AssertExpectations(t)
-	})
-
-	t.Run("stat dir path success", func(t *testing.T) {
-		expectedInfo := mocks.NewMockFileInfo(t)
-		m.EXPECT().GetObjectMeta(fs.ctx, bucket, "path/to/dir/").Return(expectedInfo, nil).Once()
-		info, err := fs.Stat("/path/to/dir/")
-		assert.Nil(t, err)
-		assert.Equal(t, expectedInfo, info)
-		m.AssertExpectations(t)
-	})
-
-	t.Run("stat non-existent file", func(t *testing.T) {
-		m.EXPECT().GetObjectMeta(fs.ctx, bucket, "nonexistent.txt").Return(nil, os.ErrNotExist).Once()
-		_, err := fs.Stat("nonexistent.txt")
-		assert.NotNil(t, err)
-		assert.ErrorIs(t, err, os.ErrNotExist)
-		m.AssertExpectations(t)
-	})
+func TestUnsupportedMetadataOperations(t *testing.T) {
+	fs, _ := newTestFs(nil)
+	require.Error(t, fs.Chmod("x", 0))
+	require.Error(t, fs.Chown("x", 0, 0))
+	require.Error(t, fs.Chtimes("x", infoTime(), infoTime()))
 }
 
-func TestFsName(t *testing.T) {
-	fs := &Fs{}
-	name := fs.Name()
-	assert.Equal(t, "OssFs", name)
-}
-
-func TestFsChmod(t *testing.T) {
-	m := mocks.NewMockObjectManager(t)
-	bucket := "test-bucket"
-	ctx := context.TODO()
-
-	fs := &Fs{
-		manager:    m,
-		bucketName: bucket,
-		ctx:        ctx,
-		separator:  "/",
-	}
-
-	t.Run("chmod returns not implemented error", func(t *testing.T) {
-		err := fs.Chmod("test.txt", 0o644)
-		assert.NotNil(t, err)
-		assert.EqualError(t, err, "OSS: method Chmod is not implemented")
-	})
-}
-
-func TestFsChown(t *testing.T) {
-	m := mocks.NewMockObjectManager(t)
-	bucket := "test-bucket"
-	ctx := context.TODO()
-
-	fs := &Fs{
-		manager:    m,
-		bucketName: bucket,
-		ctx:        ctx,
-		separator:  "/",
-	}
-
-	t.Run("chown returns not implemented error", func(t *testing.T) {
-		err := fs.Chown("test.txt", 1000, 1000)
-		assert.NotNil(t, err)
-		assert.EqualError(t, err, "OSS: method Chown is not implemented")
-	})
-}
-
-func TestFsChtimes(t *testing.T) {
-	m := mocks.NewMockObjectManager(t)
-	bucket := "test-bucket"
-	ctx := context.TODO()
-
-	fs := &Fs{
-		manager:    m,
-		bucketName: bucket,
-		ctx:        ctx,
-		separator:  "/",
-	}
-
-	t.Run("chtimes returns not implemented error", func(t *testing.T) {
-		now := time.Now()
-		err := fs.Chtimes("test.txt", now, now)
-		assert.NotNil(t, err)
-		assert.EqualError(t, err, "OSS: method Chtimes is not implemented")
-	})
-}
+func infoTime() (zeroTime time.Time) { return }

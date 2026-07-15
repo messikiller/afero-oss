@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"sync"
 	"syscall"
 
@@ -11,9 +12,8 @@ import (
 )
 
 const (
-	maxPreloadSize = 100 * 1024 * 1024 // 100MB max file size for preload
-	flagMask       = 0x3               // Mask for extracting read/write mode
-	flagMax        = 0x2               // Maximum value before masking needed
+	defaultMaxPreloadSize = 100 * 1024 * 1024 // 100MB
+	flagMask              = 0x3
 )
 
 type File struct {
@@ -23,335 +23,403 @@ type File struct {
 	offset   int64
 	isDir    bool
 
-	// Whether the file is written.
-	dirty bool
+	dirty        bool
+	closed       bool
+	preloaded    bool
+	preloadedFd  afero.File
+	preloadedKey string
 
-	// Whether the file is closed.
-	closed bool
-
-	// Whether the file is preloaded downto local.
-	preloaded   bool
-	preloadedFd afero.File
+	dirEntries []os.FileInfo
+	dirOffset  int
+	version    uint64
 
 	mu sync.Mutex
 }
 
-// NewOssFile creates a new File instance, the name of file will be normalized.
+// NewOssFile creates a new File instance. Each instance owns an independent
+// file offset and preload file.
 func NewOssFile(name string, flag int, fs *Fs) (*File, error) {
+	normalized := fs.normFileName(name)
 	return &File{
-		name:        fs.normFileName(name),
-		fs:          fs,
-		openFlag:    flag,
-		offset:      0,
-		dirty:       false,
-		closed:      false,
-		isDir:       fs.isDir(fs.normFileName(name)),
-		preloaded:   false,
-		preloadedFd: nil,
+		name:     normalized,
+		fs:       fs,
+		openFlag: flag,
+		isDir:    normalized == "" || fs.isDir(normalized),
+		version:  fs.versionFor(normalized),
 	}, nil
 }
 
-// preload will preload the file to specific preload-filesystem.
-func (f *File) preload() error {
+func (f *File) preloadLocked() (err error) {
+	if f.preloaded {
+		return nil
+	}
+
 	fi, err := f.fs.manager.GetObjectMeta(f.fs.ctx, f.fs.bucketName, f.name)
 	if err != nil {
 		return err
 	}
-
-	if fi.Size() > maxPreloadSize {
-		return fmt.Errorf("file too large for preload: %d bytes (max: %d bytes)", fi.Size(), maxPreloadSize)
+	if limit := f.fs.maxPreloadSize; limit > 0 && fi.Size() > limit {
+		return fmt.Errorf("file too large for preload: %d bytes (max: %d bytes)", fi.Size(), limit)
 	}
 
-	pfs := f.fs.preloadFs
-	if _, err := pfs.Stat(f.name); err == nil {
-		if e := pfs.Remove(f.name); e != nil {
-			return e
-		}
-	}
-	pfd, err := f.fs.preloadFs.Create(f.name)
+	pfd, err := afero.TempFile(f.fs.preloadFs, ".", "afero-oss-preload-")
 	if err != nil {
 		return err
 	}
+	key := pfd.Name()
+	defer func() {
+		if err != nil {
+			_ = pfd.Close()
+			_ = f.fs.preloadFs.Remove(key)
+		}
+	}()
 
-	r, clean, e := f.fs.manager.GetObject(f.fs.ctx, f.fs.bucketName, f.name)
-	if e != nil {
-		return e
-	}
-	defer clean()
-
-	if _, err := io.Copy(pfd, r); err != nil {
+	r, clean, err := f.fs.manager.GetObject(f.fs.ctx, f.fs.bucketName, f.name)
+	if err != nil {
 		return err
 	}
-
-	if _, err := pfd.Seek(f.offset, io.SeekStart); err != nil {
+	if clean != nil {
+		defer clean()
+	}
+	if _, err = io.Copy(pfd, r); err != nil {
+		return err
+	}
+	if _, err = pfd.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 
 	f.preloadedFd = pfd
+	f.preloadedKey = key
 	f.preloaded = true
 	return nil
 }
 
-// getFileInfo returns the FileInfo of file.
-func (f *File) getFileInfo() (os.FileInfo, error) {
-	if f.dirty {
-		if f.preloadedFd == nil {
-			return nil, syscall.EACCES
+func (f *File) getFileInfoLocked() (os.FileInfo, error) {
+	if f.closed {
+		return nil, afero.ErrFileClosed
+	}
+	if f.preloaded && f.preloadedFd != nil {
+		fi, err := f.preloadedFd.Stat()
+		if err != nil {
+			return nil, err
 		}
-		return f.preloadedFd.Stat()
+		return NewFileInfo(path.Base(f.name), fi.Size(), fi.ModTime()), nil
 	}
 	return f.fs.Stat(f.name)
 }
 
-// isReadable returns whether the file is readable by openFlag of the file instance.
-func (f *File) isReadable() bool {
+func (f *File) readableLocked() bool {
 	if f.closed {
 		return false
 	}
-	masked := f.openFlag
-	if masked > flagMax {
-		masked = f.openFlag & flagMask
-	}
-	return masked == os.O_RDONLY || masked == os.O_RDWR
+	mode := f.openFlag & flagMask
+	return mode == os.O_RDONLY || mode == os.O_RDWR
 }
 
-// isWriteable returns whether the file is writeable by openFlag of the file instance.
-func (f *File) isWriteable() bool {
+func (f *File) writeableLocked() bool {
 	if f.closed {
 		return false
 	}
-	masked := f.openFlag
-	if masked > flagMax {
-		masked = f.openFlag & flagMask
-	}
-	return masked == os.O_WRONLY || masked == os.O_RDWR
+	mode := f.openFlag & flagMask
+	return mode == os.O_WRONLY || mode == os.O_RDWR
 }
 
-// isAppendOnly returns whether the file is append-only by openFlag of the file instance.
-func (f *File) isAppendOnly() bool {
-	return f.isWriteable() && f.openFlag&os.O_APPEND != 0
+func (f *File) appendOnlyLocked() bool {
+	return f.writeableLocked() && f.openFlag&os.O_APPEND != 0
 }
 
-// Read reads up to len(p) bytes from the File, it implements interface: io.Reader.
-func (f *File) Read(p []byte) (int, error) {
-	if !f.isReadable() || f.isDir {
-		return 0, syscall.EPERM
+func (f *File) readAtLocked(p []byte, off int64) (int, error) {
+	if f.closed {
+		return 0, afero.ErrFileClosed
 	}
-	n, err := f.ReadAt(p, f.offset)
-	if err != nil {
-		return n, err
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.offset += int64(n)
-	return n, err
-}
-
-// ReadAt reads len(p) bytes from the File starting at byte offset off into p.
-// It implements interface: io.ReaderAt.
-func (f *File) ReadAt(p []byte, off int64) (int, error) {
-	if !f.isReadable() || f.isDir {
-		return 0, syscall.EPERM
-	}
-	reader, cleanUp, err := f.fs.manager.GetObjectPart(f.fs.ctx, f.fs.bucketName, f.name, off, off+int64(len(p)))
-	if err != nil {
-		return 0, err
-	}
-	defer cleanUp()
-	return reader.Read(p)
-}
-
-// Seek sets the offset for the next Read or Write on file to offset,
-func (f *File) Seek(offset int64, whence int) (int64, error) {
-	if (!f.isReadable() && !f.isWriteable()) || f.isDir {
-		return 0, syscall.EPERM
-	}
-	fi, err := f.getFileInfo()
-	if err != nil {
-		return 0, err
-	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	max := fi.Size()
-	var newOffset int64
-	switch whence {
-	case io.SeekCurrent:
-		newOffset = f.offset + offset
-	case io.SeekStart:
-		newOffset = offset
-	case io.SeekEnd:
-		newOffset = max + offset
-	default:
-		return 0, fmt.Errorf("invalid whence value: %v", whence)
-	}
-	if newOffset < 0 || newOffset > max {
-		return 0, afero.ErrOutOfRange
-	}
-	f.offset = newOffset
-	return f.offset, nil
-}
-
-// Write writes len(p) bytes to the File. It implements interface: io.Writer.
-func (f *File) Write(p []byte) (int, error) {
-	if !f.isWriteable() {
-		return 0, syscall.EPERM
-	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if f.isAppendOnly() {
-		fi, err := f.getFileInfo()
-		if err != nil {
-			return 0, err
-		}
-		return f.doWriteAt(p, fi.Size())
-	}
-
-	n, e := f.doWriteAt(p, f.offset)
-	if e != nil {
-		return 0, e
-	}
-	f.offset += int64(n)
-	return n, e
-}
-
-// doWriteAt write len(p) bytes at the offset of the File. It will preload file into preload-filesystem.
-func (f *File) doWriteAt(p []byte, off int64) (int, error) {
-	if f.isDir {
-		return 0, syscall.EPERM
-	}
-
-	if !f.preloaded {
-		if err := f.preload(); err != nil {
-			return 0, err
-		}
-	}
-
-	n, e := f.preloadedFd.WriteAt(p, off)
-	f.dirty = true
-	if f.fs.autoSync {
-		f.Sync()
-	}
-	return n, e
-}
-
-// WriteAt writes len(p) bytes to the File starting at byte offset off.
-// It implements interface: io.WriterAt.
-func (f *File) WriteAt(p []byte, off int64) (int, error) {
-	if !f.isWriteable() || f.isAppendOnly() {
+	if !f.readableLocked() || f.isDir {
 		return 0, syscall.EPERM
 	}
 	if off < 0 {
 		return 0, syscall.ERANGE
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.doWriteAt(p, off)
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if f.preloaded && f.preloadedFd != nil {
+		return f.preloadedFd.ReadAt(p, off)
+	}
+
+	reader, clean, err := f.fs.manager.GetObjectPart(
+		f.fs.ctx, f.fs.bucketName, f.name, off, off+int64(len(p))-1,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if clean != nil {
+		defer clean()
+	}
+	n, err := io.ReadFull(reader, p)
+	if err == io.ErrUnexpectedEOF {
+		err = io.EOF
+	}
+	return n, err
 }
 
-// Close will close the file and remove it from opened files map.
-// It implements interface: io.Closer.
+// Read reads up to len(p) bytes and advances the file offset by the number of
+// bytes actually read, including short reads that return io.EOF.
+func (f *File) Read(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	n, err := f.readAtLocked(p, f.offset)
+	f.offset += int64(n)
+	return n, err
+}
+
+// ReadAt reads len(p) bytes starting at off without changing the file offset.
+func (f *File) ReadAt(p []byte, off int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.readAtLocked(p, off)
+}
+
+func (f *File) Seek(offset int64, whence int) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.closed {
+		return 0, afero.ErrFileClosed
+	}
+	if (!f.readableLocked() && !f.writeableLocked()) || f.isDir {
+		return 0, syscall.EPERM
+	}
+	fi, err := f.getFileInfoLocked()
+	if err != nil {
+		return 0, err
+	}
+
+	var next int64
+	switch whence {
+	case io.SeekCurrent:
+		next = f.offset + offset
+	case io.SeekStart:
+		next = offset
+	case io.SeekEnd:
+		next = fi.Size() + offset
+	default:
+		return 0, fmt.Errorf("invalid whence value: %v", whence)
+	}
+	if next < 0 {
+		return 0, afero.ErrOutOfRange
+	}
+	f.offset = next
+	return next, nil
+}
+
+func (f *File) doWriteAtLocked(p []byte, off int64) (int, error) {
+	if f.closed {
+		return 0, afero.ErrFileClosed
+	}
+	if f.isDir {
+		return 0, syscall.EPERM
+	}
+	if off < 0 {
+		return 0, syscall.ERANGE
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if err := f.preloadLocked(); err != nil {
+		return 0, err
+	}
+	n, err := f.preloadedFd.WriteAt(p, off)
+	if n > 0 {
+		f.dirty = true
+	}
+	if err == nil && f.fs.autoSync && f.dirty {
+		err = f.syncLocked()
+	}
+	return n, err
+}
+
+func (f *File) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.closed {
+		return 0, afero.ErrFileClosed
+	}
+	if !f.writeableLocked() {
+		return 0, syscall.EPERM
+	}
+	off := f.offset
+	if f.appendOnlyLocked() {
+		fi, err := f.getFileInfoLocked()
+		if err != nil {
+			return 0, err
+		}
+		off = fi.Size()
+	}
+	n, err := f.doWriteAtLocked(p, off)
+	if !f.appendOnlyLocked() {
+		f.offset += int64(n)
+	}
+	return n, err
+}
+
+func (f *File) WriteAt(p []byte, off int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return 0, afero.ErrFileClosed
+	}
+	if !f.writeableLocked() || f.appendOnlyLocked() {
+		return 0, syscall.EPERM
+	}
+	return f.doWriteAtLocked(p, off)
+}
+
+func (f *File) syncLocked() error {
+	if f.closed {
+		return afero.ErrFileClosed
+	}
+	if !f.dirty || !f.preloaded || f.preloadedFd == nil {
+		return nil
+	}
+	off, err := f.preloadedFd.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	defer func() { _, _ = f.preloadedFd.Seek(off, io.SeekStart) }()
+	if _, err := f.preloadedFd.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	f.fs.versionsMu.Lock()
+	defer f.fs.versionsMu.Unlock()
+	if f.fs.versions == nil {
+		f.fs.versions = make(map[string]uint64)
+	}
+	if f.fs.versions[f.name] != f.version {
+		return ErrWriteConflict
+	}
+	if _, err := f.fs.manager.PutObject(f.fs.ctx, f.fs.bucketName, f.name, f.preloadedFd); err != nil {
+		return err
+	}
+	f.fs.versions[f.name]++
+	f.version = f.fs.versions[f.name]
+	f.dirty = false
+	return nil
+}
+
+// Close persists dirty content, then closes and removes this handle's private
+// preload file. If persistence fails, the handle remains open so Sync/Close can
+// be retried without losing the local changes.
 func (f *File) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
-	var firstErr error
-
-	if err := f.Sync(); err != nil {
-		firstErr = err
+	if f.closed {
+		return afero.ErrFileClosed
 	}
-
-	f.fs.filesMu.Lock()
-	delete(f.fs.openedFiles, f.name)
-	f.fs.filesMu.Unlock()
-
-	if f.preloaded {
-		if err := f.fs.preloadFs.Remove(f.name); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		if f.preloadedFd != nil {
-			if err := f.preloadedFd.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-		f.preloadedFd = nil
-		f.preloaded = false
+	if err := f.syncLocked(); err != nil {
+		return err
 	}
-	f.dirty = false
+	var closeErr error
+	if f.preloadedFd != nil {
+		if err := f.preloadedFd.Close(); err != nil {
+			closeErr = err
+		}
+		if err := f.fs.preloadFs.Remove(f.preloadedKey); err != nil && !os.IsNotExist(err) && closeErr == nil {
+			closeErr = err
+		}
+	}
+	f.preloadedFd = nil
+	f.preloadedKey = ""
+	f.preloaded = false
 	f.closed = true
-	return firstErr
+	return closeErr
 }
 
-func (f *File) Name() string {
-	return f.name
-}
+func (f *File) Name() string { return f.name }
 
-// Readdir read count files from the directory.
-func (f *File) Readdir(count int) ([]os.FileInfo, error) {
-	if !f.isReadable() || !f.isDir {
-		return nil, syscall.EPERM
+func (f *File) loadDirEntriesLocked() error {
+	if f.dirEntries != nil {
+		return nil
 	}
-
-	fis, err := f.fs.manager.ListObjects(f.fs.ctx, f.fs.bucketName, f.fs.ensureAsDir(f.name), count)
-	return fis, err
-}
-
-// Readdirnames read n file names form the directory.
-func (f *File) Readdirnames(n int) ([]string, error) {
-	if !f.isReadable() || !f.isDir {
-		return nil, syscall.EPERM
-	}
-
-	fis, err := f.Readdir(n)
+	entries, err := f.fs.manager.ListObjects(f.fs.ctx, f.fs.bucketName, f.fs.ensureAsDir(f.name), 0)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	f.dirEntries = entries
+	return nil
+}
+
+func (f *File) Readdir(count int) ([]os.FileInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var fNames []string
-	for _, fi := range fis {
-		fNames = append(fNames, fi.Name())
+	if f.closed {
+		return nil, afero.ErrFileClosed
 	}
+	if !f.readableLocked() || !f.isDir {
+		return nil, syscall.EPERM
+	}
+	if err := f.loadDirEntriesLocked(); err != nil {
+		return nil, err
+	}
+	if f.dirOffset >= len(f.dirEntries) {
+		if count > 0 {
+			return nil, io.EOF
+		}
+		return []os.FileInfo{}, nil
+	}
+	end := len(f.dirEntries)
+	if count > 0 && f.dirOffset+count < end {
+		end = f.dirOffset + count
+	}
+	entries := append([]os.FileInfo(nil), f.dirEntries[f.dirOffset:end]...)
+	f.dirOffset = end
+	return entries, nil
+}
 
-	return fNames, nil
+func (f *File) Readdirnames(n int) ([]string, error) {
+	entries, err := f.Readdir(n)
+	names := make([]string, len(entries))
+	for i, entry := range entries {
+		names[i] = entry.Name()
+	}
+	return names, err
 }
 
 func (f *File) Stat() (os.FileInfo, error) {
-	return f.getFileInfo()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getFileInfoLocked()
 }
 
-// Sync will sync the preloaded file into cloud storage.
 func (f *File) Sync() error {
-	if f.preloaded && f.preloadedFd != nil {
-		off, err := f.preloadedFd.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return err
-		}
-		if _, err := f.preloadedFd.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-		if _, err := f.fs.manager.PutObject(f.fs.ctx, f.fs.bucketName, f.name, f.preloadedFd); err != nil {
-			return err
-		}
-		if _, err := f.preloadedFd.Seek(off, io.SeekStart); err != nil {
-			return err
-		}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.syncLocked()
+}
+
+func (f *File) Truncate(size int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return afero.ErrFileClosed
+	}
+	if !f.writeableLocked() || f.isDir {
+		return syscall.EPERM
+	}
+	if size < 0 {
+		return afero.ErrOutOfRange
+	}
+	if err := f.preloadLocked(); err != nil {
+		return err
+	}
+	if err := f.preloadedFd.Truncate(size); err != nil {
+		return err
+	}
+	f.dirty = true
+	if f.fs.autoSync {
+		return f.syncLocked()
 	}
 	return nil
 }
 
-func (f *File) Truncate(size int64) error {
-	if !f.isWriteable() || f.isDir {
-		return syscall.EPERM
-	}
-	p := make([]byte, size)
-	_, err := f.Write(p)
-	return err
-}
-
-func (f *File) WriteString(s string) (int, error) {
-	return f.Write([]byte(s))
-}
+func (f *File) WriteString(s string) (int, error) { return f.Write([]byte(s)) }

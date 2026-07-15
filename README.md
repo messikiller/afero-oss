@@ -13,9 +13,9 @@ Afero-OSS is an implementation of Alibaba Cloud Object Storage Service (OSS) bas
 - 🔄 Full compatibility with Afero file system interface
 - 🚀 Support for Alibaba Cloud OSS v2 SDK
 - 📂 Provides standard file and directory operations
-- 🔒 Concurrent safe design
-- 💾 Memory preloading mechanism for efficient file operations (with 100MB size limit)
-- ⚡ Manual sync control for optimized performance
+- 🔒 Concurrent-safe file handles with write-conflict detection within one `Fs`
+- 💾 Configurable preload filesystem (100MB default limit for memory preloading)
+- ⚡ Dirty-only synchronization with automatic persistence on close
 
 ## Installation
 
@@ -31,7 +31,6 @@ go get github.com/messikiller/afero-oss
 package main
 
 import (
-    "github.com/spf13/afero"
     "github.com/messikiller/afero-oss"
 )
 
@@ -52,12 +51,13 @@ func main() {
     if err != nil {
         panic(err)
     }
-    defer file.Close()
-
-    file.WriteString("Hello, Afero-OSS!")
-    
-    // Important: Manually sync to upload changes to OSS
-    file.Sync()
+    if _, err := file.WriteString("Hello, Afero-OSS!"); err != nil {
+        panic(err)
+    }
+    // Close automatically uploads dirty data.
+    if err := file.Close(); err != nil {
+        panic(err)
+    }
 }
 ```
 
@@ -70,32 +70,33 @@ func main() {
 
 ## Best Practices
 
-### Manual Synchronization
+### Synchronization
 
-By default, `autoSync` is disabled for better performance. You need to manually call `Sync()` to upload changes to OSS:
+Per-write automatic synchronization is disabled by default, but `Close()` always uploads dirty data. Call `Sync()` only when data must be persisted while the file remains open:
 
 ```go
 file, _ := ossFs.Create("example.txt")
 file.WriteString("Hello, World!")
-file.Sync()  // Upload to OSS
-file.Close()
+file.Sync()  // Optional: persist before Close
+file.Close() // Does not upload again when there are no new writes
 ```
 
 ### File Size Considerations
 
-The preload mechanism has a 100MB size limit. For larger files, use a disk-based preload filesystem:
+Memory preloading has a default 100MB limit. For larger files, use a disk-backed filesystem and explicitly disable the limit:
 
 ```go
 ossFs := ossfs.NewOssFs(...)
-ossFs.WithPreloadFs(afero.NewBasePathFs(afero.NewOsFs(), "/tmp"))
+ossFs.WithPreloadFs(afero.NewBasePathFs(afero.NewOsFs(), "/tmp")).WithMaxPreloadSize(0)
 ```
 
 ## Limitations
 
 - Does not support file system-specific operations like `Chmod`, `Chown`, `Chtimes`
 - Depends on Alibaba Cloud OSS service
-- Preload size limit: 100MB per file (configurable via `WithPreloadFs`)
-- Requires manual `Sync()` calls to persist changes (autoSync is disabled by default)
+- Writes preload and re-upload the complete object, so frequent random updates to very large files are inefficient
+- Configure the limit with `WithMaxPreloadSize`; zero means unlimited
+- One `Fs` returns `ErrWriteConflict` for stale local handles; writes from separate processes still require application-level coordination
 
 ## Contributing
 

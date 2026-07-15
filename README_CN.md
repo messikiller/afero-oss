@@ -11,9 +11,9 @@ Afero-OSS 是一个基于 Afero 文件系统接口的阿里云对象存储（OSS
 - 🔄 完全兼容 Afero 文件系统接口
 - 🚀 支持阿里云OSS v2 SDK
 - 📂 提供文件和目录的标准操作
-- 🔒 并发安全设计
-- 💾 内存预加载机制，高效文件操作（100MB 大小限制）
-- ⚡ 手动同步控制，优化性能
+- 🔒 文件句柄并发安全，同一 `Fs` 实例内检测写冲突
+- 💾 可配置的预加载文件系统（内存模式默认限制 100MB）
+- ⚡ 仅同步脏数据，关闭文件时自动持久化
 
 ## 安装
 
@@ -29,7 +29,6 @@ go get github.com/messikiller/afero-oss
 package main
 
 import (
-    "github.com/spf13/afero"
     "github.com/messikiller/afero-oss"
 )
 
@@ -50,12 +49,13 @@ func main() {
     if err != nil {
         panic(err)
     }
-    defer file.Close()
-
-    file.WriteString("Hello, Afero-OSS!")
-    
-    // 重要：手动同步以上传更改到 OSS
-    file.Sync()
+    if _, err := file.WriteString("Hello, Afero-OSS!"); err != nil {
+        panic(err)
+    }
+    // Close 会自动上传脏数据。
+    if err := file.Close(); err != nil {
+        panic(err)
+    }
 }
 ```
 
@@ -68,32 +68,33 @@ func main() {
 
 ## 最佳实践
 
-### 手动同步
+### 同步行为
 
-默认情况下，`autoSync` 已禁用以获得更好的性能。您需要手动调用 `Sync()` 将更改上传到 OSS：
+默认禁用逐次写入自动同步，但 `Close()` 始终会上传脏数据。只有在文件保持打开期间需要提前持久化时，才需要调用 `Sync()`：
 
 ```go
 file, _ := ossFs.Create("example.txt")
 file.WriteString("Hello, World!")
-file.Sync()  // 上传到 OSS
-file.Close()
+file.Sync()  // 可选：在 Close 前提前上传
+file.Close() // 没有新写入时不会重复上传
 ```
 
 ### 文件大小注意事项
 
-预加载机制有 100MB 的大小限制。对于更大的文件，请使用基于磁盘的预加载文件系统：
+默认内存预加载限制为 100MB。处理更大文件时，请使用磁盘文件系统并显式关闭限制：
 
 ```go
 ossFs := ossfs.NewOssFs(...)
-ossFs.WithPreloadFs(afero.NewBasePathFs(afero.NewOsFs(), "/tmp"))
+ossFs.WithPreloadFs(afero.NewBasePathFs(afero.NewOsFs(), "/tmp")).WithMaxPreloadSize(0)
 ```
 
 ## 局限性
 
 - 不支持 `Chmod`、`Chown`、`Chtimes` 等文件系统特定操作
 - 依赖阿里云 OSS 服务
-- 预加载大小限制：每个文件 100MB（可通过 `WithPreloadFs` 配置）
-- 需要手动调用 `Sync()` 来持久化更改（默认禁用 autoSync）
+- 写入需要预加载并重新上传完整对象，不适合频繁随机修改超大文件
+- 预加载限制通过 `WithMaxPreloadSize` 配置，`0` 表示不限制
+- 同一 `Fs` 实例会返回 `ErrWriteConflict` 防止旧句柄静默覆盖；跨进程写入仍需业务层协调
 
 ## 贡献
 

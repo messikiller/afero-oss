@@ -2,10 +2,13 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"path"
+	"sort"
 	"strings"
 	"time"
 
@@ -13,9 +16,11 @@ import (
 	"github.com/spf13/afero"
 )
 
+const ossDirSeparator = "/"
+
 var (
-	ossDirSeparator    string      = "/"
-	ossDefaultFileMode fs.FileMode = 0o755
+	ossDefaultFileMode fs.FileMode = 0o644
+	ossDefaultDirMode  fs.FileMode = 0o755
 )
 
 type OssObjectManager struct {
@@ -23,147 +28,183 @@ type OssObjectManager struct {
 	Client *oss.Client
 }
 
+func mapOSSError(op, name string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var serviceErr *oss.ServiceError
+	if errors.As(err, &serviceErr) && (serviceErr.StatusCode == 404 || serviceErr.Code == "NoSuchKey") {
+		return &os.PathError{Op: op, Path: name, Err: os.ErrNotExist}
+	}
+	return &os.PathError{Op: op, Path: name, Err: err}
+}
+
 func (m *OssObjectManager) GetObject(ctx context.Context, bucket, name string) (io.Reader, CleanUp, error) {
-	req := &oss.GetObjectRequest{
+	res, err := m.Client.GetObject(ctx, &oss.GetObjectRequest{
 		Bucket: oss.Ptr(bucket),
 		Key:    oss.Ptr(name),
+	})
+	if err != nil {
+		return nil, nil, mapOSSError("get", name, err)
 	}
-	res, err := m.Client.GetObject(ctx, req)
-	cleanUp := func() {
-		res.Body.Close()
+	if res == nil || res.Body == nil {
+		return nil, nil, &os.PathError{Op: "get", Path: name, Err: io.ErrUnexpectedEOF}
 	}
-	return res.Body, cleanUp, err
+	return res.Body, func() { _ = res.Body.Close() }, nil
 }
 
 func (m *OssObjectManager) GetObjectPart(ctx context.Context, bucket, name string, start, end int64) (io.Reader, CleanUp, error) {
-	if start > end {
+	if start < 0 || end < start {
 		return nil, nil, afero.ErrOutOfRange
 	}
-	req := &oss.GetObjectRequest{
+	res, err := m.Client.GetObject(ctx, &oss.GetObjectRequest{
 		Bucket:        oss.Ptr(bucket),
 		Key:           oss.Ptr(name),
-		Range:         oss.Ptr(fmt.Sprintf("bytes=%v-%v", start, end)),
+		Range:         oss.Ptr(fmt.Sprintf("bytes=%d-%d", start, end)),
 		RangeBehavior: oss.Ptr("standard"),
+	})
+	if err != nil {
+		return nil, nil, mapOSSError("read", name, err)
 	}
-	res, err := m.Client.GetObject(ctx, req)
-	cleanUp := func() {
-		res.Body.Close()
+	if res == nil || res.Body == nil {
+		return nil, nil, &os.PathError{Op: "read", Path: name, Err: io.ErrUnexpectedEOF}
 	}
-	return res.Body, cleanUp, err
+	return res.Body, func() { _ = res.Body.Close() }, nil
 }
 
 func (m *OssObjectManager) DeleteObject(ctx context.Context, bucket, name string) error {
-	req := &oss.DeleteObjectRequest{
+	_, err := m.Client.DeleteObject(ctx, &oss.DeleteObjectRequest{
 		Bucket: oss.Ptr(bucket),
 		Key:    oss.Ptr(name),
-	}
-	_, err := m.Client.DeleteObject(ctx, req)
-	return err
+	})
+	return mapOSSError("remove", name, err)
 }
 
 func (m *OssObjectManager) IsObjectExist(ctx context.Context, bucket, name string) (bool, error) {
-	return m.Client.IsObjectExist(ctx, bucket, name)
+	exists, err := m.Client.IsObjectExist(ctx, bucket, name)
+	return exists, mapOSSError("stat", name, err)
 }
 
 func (m *OssObjectManager) PutObject(ctx context.Context, bucket, name string, reader io.Reader) (bool, error) {
-	req := &oss.PutObjectRequest{
+	_, err := m.Client.PutObject(ctx, &oss.PutObjectRequest{
 		Bucket: oss.Ptr(bucket),
 		Key:    oss.Ptr(name),
 		Body:   reader,
-	}
-	_, err := m.Client.PutObject(ctx, req)
+	})
 	if err != nil {
-		return false, err
+		return false, mapOSSError("write", name, err)
 	}
 	return true, nil
 }
 
 func (m *OssObjectManager) CopyObject(ctx context.Context, bucket, srcName, targetName string) error {
-	req := &oss.CopyObjectRequest{
+	_, err := m.Client.CopyObject(ctx, &oss.CopyObjectRequest{
 		Bucket:       oss.Ptr(bucket),
 		Key:          oss.Ptr(targetName),
 		SourceKey:    oss.Ptr(srcName),
 		SourceBucket: oss.Ptr(bucket),
 		StorageClass: oss.StorageClassStandard,
-	}
-	_, err := m.Client.CopyObject(ctx, req)
-	return err
+	})
+	return mapOSSError("rename", srcName, err)
 }
 
 func (m *OssObjectManager) GetObjectMeta(ctx context.Context, bucket, name string) (os.FileInfo, error) {
-	req := &oss.HeadObjectRequest{
+	res, err := m.Client.HeadObject(ctx, &oss.HeadObjectRequest{
 		Bucket: oss.Ptr(bucket),
 		Key:    oss.Ptr(name),
-	}
-
-	res, err := m.Client.HeadObject(ctx, req)
+	})
 	if err != nil {
-		return nil, err
+		return nil, mapOSSError("stat", name, err)
 	}
-	return &OssObjectMeta{
-		name:           name,
-		size:           res.ContentLength,
-		lastModifiedAt: *res.LastModified,
-	}, nil
+	if res == nil || res.LastModified == nil {
+		return nil, &os.PathError{Op: "stat", Path: name, Err: io.ErrUnexpectedEOF}
+	}
+	return newOssObjectMeta(displayName(name), res.ContentLength, *res.LastModified, strings.HasSuffix(name, ossDirSeparator)), nil
+}
+
+func displayName(name string) string {
+	trimmed := strings.TrimSuffix(name, ossDirSeparator)
+	if trimmed == "" {
+		return ossDirSeparator
+	}
+	return path.Base(trimmed)
+}
+
+func appendEntry(entries []os.FileInfo, seen map[string]bool, entry *OssObjectMeta, count int) ([]os.FileInfo, bool) {
+	key := fmt.Sprintf("%t:%s", entry.dir, entry.name)
+	if seen[key] {
+		return entries, false
+	}
+	seen[key] = true
+	entries = append(entries, entry)
+	return entries, count > 0 && len(entries) >= count
 }
 
 func (m *OssObjectManager) ListObjects(ctx context.Context, bucket, prefix string, count int) ([]os.FileInfo, error) {
-	req := &oss.ListObjectsV2Request{
+	paginator := m.Client.NewListObjectsV2Paginator(&oss.ListObjectsV2Request{
 		Bucket:    oss.Ptr(bucket),
 		Delimiter: oss.Ptr(ossDirSeparator),
 		Prefix:    oss.Ptr(prefix),
-	}
-	p := m.Client.NewListObjectsV2Paginator(req)
+	})
+	entries := make([]os.FileInfo, 0)
+	seen := make(map[string]bool)
 
-	s := make([]os.FileInfo, 0)
-
-loop:
-	for p.HasNext() {
-		page, err := p.NextPage(ctx)
+	for paginator.HasNext() {
+		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, err
+			return nil, mapOSSError("readdir", prefix, err)
 		}
-
 		for _, obj := range page.Contents {
-			s = append(s, &OssObjectMeta{
-				name:           oss.ToString(obj.Key),
-				size:           obj.Size,
-				lastModifiedAt: oss.ToTime(obj.LastModified),
-			})
-			if len(s) >= count {
-				break loop
+			key := oss.ToString(obj.Key)
+			if key == prefix {
+				continue
+			}
+			relative := strings.TrimPrefix(key, prefix)
+			entry := newOssObjectMeta(displayName(relative), obj.Size, oss.ToTime(obj.LastModified), strings.HasSuffix(key, ossDirSeparator))
+			var full bool
+			entries, full = appendEntry(entries, seen, entry, count)
+			if full {
+				break
 			}
 		}
+		if count > 0 && len(entries) >= count {
+			break
+		}
+		for _, commonPrefix := range page.CommonPrefixes {
+			key := oss.ToString(commonPrefix.Prefix)
+			relative := strings.TrimPrefix(key, prefix)
+			entry := newOssObjectMeta(displayName(relative), 0, time.Time{}, true)
+			var full bool
+			entries, full = appendEntry(entries, seen, entry, count)
+			if full {
+				break
+			}
+		}
+		if count > 0 && len(entries) >= count {
+			break
+		}
 	}
-
-	return s, nil
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	return entries, nil
 }
 
 func (m *OssObjectManager) ListAllObjects(ctx context.Context, bucket, prefix string) ([]os.FileInfo, error) {
-	req := &oss.ListObjectsV2Request{
+	paginator := m.Client.NewListObjectsV2Paginator(&oss.ListObjectsV2Request{
 		Bucket: oss.Ptr(bucket),
 		Prefix: oss.Ptr(prefix),
-	}
-	p := m.Client.NewListObjectsV2Paginator(req)
-
-	s := make([]os.FileInfo, 0)
-
-	for p.HasNext() {
-		page, err := p.NextPage(ctx)
+	})
+	entries := make([]os.FileInfo, 0)
+	for paginator.HasNext() {
+		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, err
+			return nil, mapOSSError("readdir", prefix, err)
 		}
-
 		for _, obj := range page.Contents {
-			s = append(s, &OssObjectMeta{
-				name:           oss.ToString(obj.Key),
-				size:           obj.Size,
-				lastModifiedAt: oss.ToTime(obj.LastModified),
-			})
+			key := oss.ToString(obj.Key)
+			entries = append(entries, newOssObjectMeta(key, obj.Size, oss.ToTime(obj.LastModified), strings.HasSuffix(key, ossDirSeparator)))
 		}
 	}
-
-	return s, nil
+	return entries, nil
 }
 
 type OssObjectMeta struct {
@@ -171,39 +212,34 @@ type OssObjectMeta struct {
 	name           string
 	size           int64
 	lastModifiedAt time.Time
+	dir            bool
+}
+
+func newOssObjectMeta(name string, size int64, updatedAt time.Time, dir bool) *OssObjectMeta {
+	return &OssObjectMeta{name: name, size: size, lastModifiedAt: updatedAt, dir: dir}
 }
 
 func NewOssObjectMeta(name string, size int64, updatedAt time.Time) *OssObjectMeta {
-	return &OssObjectMeta{
-		name:           name,
-		size:           size,
-		lastModifiedAt: updatedAt,
-	}
+	return newOssObjectMeta(name, size, updatedAt, strings.HasSuffix(name, ossDirSeparator))
 }
 
-func (objMeta *OssObjectMeta) isDir() bool {
-	return strings.HasSuffix(objMeta.name, ossDirSeparator)
+func NewOssDirMeta(name string, updatedAt time.Time) *OssObjectMeta {
+	return newOssObjectMeta(displayName(name), 0, updatedAt, true)
 }
 
-func (objMeta *OssObjectMeta) ModTime() time.Time {
-	return objMeta.lastModifiedAt
-}
+func (objMeta *OssObjectMeta) IsDir() bool { return objMeta.dir }
+
+func (objMeta *OssObjectMeta) ModTime() time.Time { return objMeta.lastModifiedAt }
 
 func (objMeta *OssObjectMeta) Mode() fs.FileMode {
-	if objMeta.isDir() {
-		return ossDefaultFileMode | fs.ModeDir
+	if objMeta.dir {
+		return ossDefaultDirMode | fs.ModeDir
 	}
 	return ossDefaultFileMode
 }
 
-func (objMeta *OssObjectMeta) Name() string {
-	return objMeta.name
-}
+func (objMeta *OssObjectMeta) Name() string { return objMeta.name }
 
-func (objMeta *OssObjectMeta) Size() int64 {
-	return objMeta.size
-}
+func (objMeta *OssObjectMeta) Size() int64 { return objMeta.size }
 
-func (objMeta *OssObjectMeta) Sys() any {
-	return nil
-}
+func (objMeta *OssObjectMeta) Sys() any { return nil }

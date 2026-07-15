@@ -15,3 +15,9 @@ func NewFileInfo(name string, size int64, updatedAt time.Time) *FileInfo {
 		OssObjectMeta: utils.NewOssObjectMeta(name, size, updatedAt),
 	}
 }
+
+func NewDirFileInfo(name string, updatedAt time.Time) *FileInfo {
+	return &FileInfo{
+		OssObjectMeta: utils.NewOssDirMeta(name, updatedAt),
+	}
+}

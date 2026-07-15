@@ -1,6 +1,7 @@
 package ossfs
 
 import (
+	"path"
 	"strings"
 )
 
@@ -18,6 +19,9 @@ func (fs *Fs) ensureAsDir(s string) string {
 		sep = "/"
 	}
 	s = fs.normFileName(s)
+	if s == "" {
+		return ""
+	}
 	if !strings.HasSuffix(s, sep) {
 		s = s + sep
 	}
@@ -25,12 +29,14 @@ func (fs *Fs) ensureAsDir(s string) string {
 }
 
 func (fs *Fs) normFileName(s string) string {
-	sep := fs.separator
-	if fs.separator == "" {
-		sep = "/"
+	s = strings.ReplaceAll(s, "\\", "/")
+	directory := strings.HasSuffix(s, "/")
+	s = strings.TrimPrefix(path.Clean("/"+s), "/")
+	if s == "." {
+		s = ""
 	}
-	s = strings.TrimLeft(s, "/\\")
-	s = strings.ReplaceAll(s, "\\", sep)
-	s = strings.ReplaceAll(s, "/", sep)
+	if directory && s != "" {
+		s += "/"
+	}
 	return s
 }
